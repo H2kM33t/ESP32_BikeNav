@@ -1,0 +1,6 @@
+.pio/
+.vs/
+.vscode/
+.clangd/
+.gcc-flags.json
+compile_commands.json
