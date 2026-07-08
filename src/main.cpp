@@ -47,13 +47,128 @@
 // at all on these pins.
 #define OLED_SDA 21
 #define OLED_SCL 22
+// Common SH1106/SSD1306 address — the scanner in setup() confirms which one
+// your module actually answers on (0x3C or 0x3D). Used here for periodic
+// health-checking, separately from u8g2's own internal bus access.
+#define OLED_I2C_ADDR 0x3C
 
 // ---------------- Display ----------------
 // 1.3" OLED modules are almost always SH1106 128x64 (not SSD1306) even
 // though they're often sold as "0.96 upgrade". If your text looks shifted
 // 2px to the right or clipped, you have the wrong controller — swap to
 // U8G2_SSD1306_128X64_NONAME_F_HW_I2C and re-test.
+// Declared here (before the I2C recovery helpers below) since they call
+// u8g2.begin() directly.
 U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/U8X8_PIN_NONE);
+
+// ---------------- I2C bus health ----------------
+// When the SDA/SCL wires get loose (as opposed to fully unplugged), the
+// I2C bus can end up "wedged" — a slave device left mid-transaction holds
+// SDA low, and the ESP32's I2C peripheral hangs waiting for a clock cycle
+// that never resolves cleanly. Just calling Wire.begin() again does NOT
+// fix this in most cases: it re-initializes the master side but does
+// nothing to unstick a slave holding the bus. That combination — a wedged
+// bus plus code that only writes to the display without checking whether
+// those writes are actually succeeding — is why reconnecting the wire by
+// itself doesn't bring the display back on its own: the last framebuffer
+// state just sits there looking "frozen"/stale forever, silently failing
+// every subsequent sendBuffer().
+//
+// Fix: periodically probe the display address; on failure, manually
+// bit-bang up to 9 SCL pulses (releases any slave stuck holding SDA low —
+// the standard I2C bus-recovery procedure), then re-run Wire.begin() AND
+// u8g2.begin() (full display re-init, since a real wire dropout can also
+// reset the OLED controller's own internal state), then force an
+// immediate re-render so whatever's currently in `nav`/`multiTurn`
+// (which keeps updating over BLE even while the display was stuck) shows
+// up right away — not stale data, just a paused screen catching up.
+bool i2cHealthy = true;
+unsigned long lastI2CCheckMs = 0;
+const unsigned long I2C_CHECK_INTERVAL_MS = 1000;
+int consecutiveI2CFailures = 0;
+const int I2C_FAILURES_BEFORE_RECOVERY = 2;
+
+void recoverI2CBus()
+{
+  Serial.println("[I2C] Bus unhealthy — running recovery (clock-pulse unstick + reinit)...");
+
+  // Release the bus from the Wire driver's control so we can bit-bang the
+  // pins directly.
+  Wire.end();
+  pinMode(OLED_SCL, OUTPUT_OPEN_DRAIN);
+  pinMode(OLED_SDA, INPUT); // just watch it
+
+  // Standard I2C bus-recovery: pulse SCL up to 9 times. If a slave is
+  // stuck holding SDA low mid-byte, this walks it through releasing the
+  // bus, since each clock pulse can complete whatever partial transaction
+  // it thinks it's in the middle of.
+  for (int i = 0; i < 9; i++)
+  {
+    digitalWrite(OLED_SCL, LOW);
+    delayMicroseconds(5);
+    digitalWrite(OLED_SCL, HIGH);
+    delayMicroseconds(5);
+    if (digitalRead(OLED_SDA) == HIGH)
+      break; // bus released early, no need for further pulses
+  }
+
+  // Re-init the I2C master peripheral and the display driver on top of it.
+  Wire.begin(OLED_SDA, OLED_SCL);
+  Wire.setClock(400000);
+  delay(20);
+  bool ok = u8g2.begin();
+  Serial.printf("[I2C] Recovery complete, u8g2.begin() returned: %s\n", ok ? "true" : "false");
+
+  consecutiveI2CFailures = 0;
+  i2cHealthy = true;
+}
+
+// Cheap probe: does the display ack its address? Doesn't touch u8g2 at
+// all, so it's safe to call frequently without disturbing the framebuffer.
+bool probeI2C()
+{
+  Wire.beginTransmission(OLED_I2C_ADDR);
+  return Wire.endTransmission() == 0;
+}
+
+// Call from loop() periodically. Detects a wedged/disconnected bus and
+// triggers recovery automatically — this is what makes the display come
+// back on its own after the wire gets reseated, instead of needing a
+// manual power cycle.
+void checkI2CHealth()
+{
+  unsigned long now = millis();
+  if (now - lastI2CCheckMs < I2C_CHECK_INTERVAL_MS)
+    return;
+  lastI2CCheckMs = now;
+
+  if (probeI2C())
+  {
+    if (!i2cHealthy)
+    {
+      // Bus just came back on a normal probe (not via forced recovery) —
+      // still worth a full reinit + redraw, same reasoning as above.
+      Serial.println("[I2C] Bus responded again — reinitializing display.");
+      recoverI2CBus();
+    }
+    consecutiveI2CFailures = 0;
+    i2cHealthy = true;
+  }
+  else
+  {
+    consecutiveI2CFailures++;
+    if (i2cHealthy)
+    {
+      Serial.printf("[I2C] Probe failed (%d/%d) — display may be disconnected or bus wedged.\n",
+                    consecutiveI2CFailures, I2C_FAILURES_BEFORE_RECOVERY);
+    }
+    if (consecutiveI2CFailures >= I2C_FAILURES_BEFORE_RECOVERY)
+    {
+      i2cHealthy = false;
+      recoverI2CBus();
+    }
+  }
+}
 
 // ---------------- BLE ----------------
 // Must match BikeNavApp/BleUuids.kt exactly.
@@ -73,6 +188,7 @@ struct NavState
   uint16_t totalDist = 0;  // metres
   uint16_t remainDist = 0; // metres
   uint8_t speedKmh = 0;
+  uint16_t roundaboutAngleDeg = 90; // exit angle, clockwise from north/straight-ahead; only meaningful when turn is a roundabout code
   String instruction = ""; // "streetName|towardName" or plain text
   bool valid = false;
   unsigned long lastUpdateMs = 0;
@@ -146,32 +262,41 @@ void drawTurnIcon(int x, int y, int size, uint8_t turn)
     u8g2.drawLine(cx + (arm - 2), cy + arm - 4, cx + (arm - 2) - 5, cy + arm - 9);
     u8g2.drawLine(cx + (arm - 2), cy + arm - 4, cx + (arm - 2) + 5, cy + arm - 9);
     break;
-  case 9: // roundabout-left: entry from bottom, exit top-LEFT (counterclockwise)
+  case 9:  // roundabout (generic — kept as a code for backward
+  case 10: // compatibility, but both now draw via the angle-based icon
+           // below using nav.roundaboutAngleDeg, so any exit direction
+           // (45/90/135/180/225/270/315/...) renders correctly instead of
+           // only ever showing a fixed "left" or "right" variant.
   {
     int r = arm - 4;
     u8g2.drawCircle(cx, cy, r);
-    u8g2.drawLine(cx + 2, cy + arm, cx + 2, cy + r);
-    int exitStartX = cx - (r * 7) / 10;
-    int exitStartY = cy - (r * 7) / 10;
-    int exitEndX = cx - arm;
-    int exitEndY = cy - arm;
+
+    // Entry is always drawn from the bottom (south) — that's "you,
+    // arriving at the roundabout". This is fixed regardless of exit.
+    u8g2.drawLine(cx, cy + arm, cx, cy + r);
+
+    // Exit is drawn at the actual angle, measured clockwise from north
+    // (straight up = continue straight across = 0deg/360deg). This is
+    // what makes 45/90/135/180/225/270/315-degree exits all look
+    // distinct instead of collapsing into just two icon variants.
+    float rad = radians((float)nav.roundaboutAngleDeg);
+    int exitStartX = cx + (int)(r * 0.7f * sin(rad));
+    int exitStartY = cy - (int)(r * 0.7f * cos(rad));
+    int exitEndX = cx + (int)(arm * sin(rad));
+    int exitEndY = cy - (int)(arm * cos(rad));
     u8g2.drawLine(exitStartX, exitStartY, exitEndX, exitEndY);
-    u8g2.drawLine(exitEndX, exitEndY, exitEndX + 6, exitEndY);
-    u8g2.drawLine(exitEndX, exitEndY, exitEndX, exitEndY + 6);
-    break;
-  }
-  case 10: // roundabout-right: entry bottom, exit top-RIGHT (clockwise)
-  {
-    int r = arm - 4;
-    u8g2.drawCircle(cx, cy, r);
-    u8g2.drawLine(cx - 2, cy + arm, cx - 2, cy + r);
-    int exitStartX = cx + (r * 7) / 10;
-    int exitStartY = cy - (r * 7) / 10;
-    int exitEndX = cx + arm;
-    int exitEndY = cy - arm;
-    u8g2.drawLine(exitStartX, exitStartY, exitEndX, exitEndY);
-    u8g2.drawLine(exitEndX, exitEndY, exitEndX - 6, exitEndY);
-    u8g2.drawLine(exitEndX, exitEndY, exitEndX, exitEndY + 6);
+
+    // Arrowhead: two short ticks angled back from the exit line's own
+    // direction, so they stay correctly oriented at any exit angle
+    // instead of only looking right for a fixed left/right case.
+    float back1 = rad + radians(150.0f);
+    float back2 = rad - radians(150.0f);
+    int p1x = exitEndX + (int)(6 * sin(back1));
+    int p1y = exitEndY - (int)(6 * cos(back1));
+    int p2x = exitEndX + (int)(6 * sin(back2));
+    int p2y = exitEndY - (int)(6 * cos(back2));
+    u8g2.drawLine(exitEndX, exitEndY, p1x, p1y);
+    u8g2.drawLine(exitEndX, exitEndY, p2x, p2y);
     break;
   }
   case 11: // merge: two lines converging into one, continuing up
@@ -460,9 +585,27 @@ void onNavPacket(const uint8_t *data, size_t len)
   nav.remainDist = (uint16_t(data[5]) << 8) | data[6];
   nav.speedKmh = data[7];
 
+  // Byte 8 (when present) is the roundabout exit angle, 0-255 mapped to
+  // 0-360 degrees, clockwise from straight-ahead. Only meaningful when
+  // turn is a roundabout code, but always present/parsed if the packet
+  // is long enough, for a consistent format. Packets from older app
+  // builds that don't send this byte still work — angle just stays at
+  // its default (90 deg / generic right-ish exit) and instruction text
+  // is read starting at byte 8 instead of 9, same as before.
+  size_t textStart;
   if (len > 8)
   {
-    nav.instruction = String((const char *)(data + 8), len - 8);
+    nav.roundaboutAngleDeg = (uint16_t)((data[8] * 360UL) / 255UL);
+    textStart = 9;
+  }
+  else
+  {
+    textStart = 8;
+  }
+
+  if (len > textStart)
+  {
+    nav.instruction = String((const char *)(data + textStart), len - textStart);
   }
   else
   {
@@ -472,9 +615,9 @@ void onNavPacket(const uint8_t *data, size_t len)
   nav.valid = true;
   nav.lastUpdateMs = millis();
 
-  Serial.printf("[NAV] turn=%d distToTurn=%um total=%um remain=%um speed=%ukmh instr='%s'\n",
+  Serial.printf("[NAV] turn=%d distToTurn=%um total=%um remain=%um speed=%ukmh roundaboutAngle=%udeg instr='%s'\n",
                 nav.turn, nav.distToTurn, nav.totalDist, nav.remainDist,
-                nav.speedKmh, nav.instruction.c_str());
+                nav.speedKmh, nav.roundaboutAngleDeg, nav.instruction.c_str());
 
   // Deliberately NOT calling renderScreen() here. NimBLE callbacks run on
   // their own FreeRTOS task, separate from the Arduino loop() task; with
@@ -626,13 +769,22 @@ void setup()
 
 void loop()
 {
+  // Detect a wedged/disconnected I2C bus (loose SDA/SCL wires) and
+  // recover it automatically — this is what makes the display come back
+  // on its own after a wire gets reseated, instead of needing a manual
+  // reset/power cycle.
+  checkI2CHealth();
+
   // Repaint frequently enough for the waiting/connected animations to
   // read as smooth motion rather than a slideshow, and so the "(stale)"
   // indicator and live-data pulse stay current even without a fresh BLE
   // packet. 120ms (~8fps) is comfortably inside what a 400kHz I2C link
   // can push a 128x64 monochrome frame in, with headroom to spare.
+  // Skipped entirely while the bus is known-unhealthy — no point pushing
+  // frames at a display that isn't acking, and it avoids repeatedly
+  // hammering a wedged bus between health-check cycles.
   static unsigned long lastRepaint = 0;
-  if (millis() - lastRepaint > 120)
+  if (i2cHealthy && millis() - lastRepaint > 120)
   {
     lastRepaint = millis();
     renderScreen();
