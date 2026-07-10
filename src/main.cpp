@@ -16,13 +16,25 @@
                 turn (small, below it), then the turn instruction
                 text as given by Google Maps (small, wraps, below that).
 
-  Packet format (matches navigation.h / Android BleNavClient.kt):
-    byte 0   : TurnDir (0-10)
+  Packet format v2 (matches NavDataState.kt / BleNavClient.kt):
+    byte 0   : TurnDir (0-15)
     byte 1-2 : distance to next turn, uint16 big-endian, metres
     byte 3-4 : total journey distance, uint16 big-endian, metres
     byte 5-6 : remaining journey distance, uint16 big-endian, metres
     byte 7   : speed in km/h (0-255)
-    byte 8+  : "streetName|towardName" ASCII  (we just show it as one string)
+    byte 8   : roundabout exit angle, 0-255 mapped to 0-360deg (fallback
+               only - used for the single frame before a bitmap arrives)
+    byte 9   : iconFlag - 1 if a 32x32 1bpp bitmap follows, else 0
+    [byte 10..137 : 128-byte packed XBM bitmap, only present if iconFlag==1]
+    remaining bytes: "streetName|towardName" ASCII (shown as one string)
+
+  Roundabout icons are now drawn from the actual bitmap Google Maps drew in
+  its own notification (forwarded by the phone, see IconBitmapConverter.kt
+  on the Android side) rather than computed from an angle estimate — same
+  approach as maisonsmd's esp32-google-maps project. This sidesteps the
+  angle-estimation misfires that came from a coarse icon hash/heuristic;
+  Google has already solved "what does a 3rd-exit roundabout look like".
+  The angle byte above is kept only as a one-frame fallback.
 
   TurnDir codes (must match BleUuids / NavAccessibilityService):
     0 = straight/continue     6 = sharp left
@@ -38,6 +50,7 @@
 #include <U8g2lib.h>
 #include <NimBLEDevice.h>
 #include <math.h>
+#include <string.h> // memcpy, for copying the roundabout icon bitmap out of BLE packets
 
 // ---------------- I2C pins ----------------
 // Most ESP32 dev boards default to SDA=21, SCL=22, but plenty of boards
@@ -188,7 +201,9 @@ struct NavState
   uint16_t totalDist = 0;  // metres
   uint16_t remainDist = 0; // metres
   uint8_t speedKmh = 0;
-  uint16_t roundaboutAngleDeg = 90; // exit angle, clockwise from north/straight-ahead; only meaningful when turn is a roundabout code
+  uint16_t roundaboutAngleDeg = 90; // exit angle fallback, only used until a bitmap arrives
+  bool hasIcon = false;             // true if iconBitmap below holds a fresh roundabout icon
+  uint8_t iconBitmap[128];          // packed 32x32 1bpp XBM bitmap, the actual icon Maps drew
   String instruction = ""; // "streetName|towardName" or plain text
   bool valid = false;
   unsigned long lastUpdateMs = 0;
@@ -263,11 +278,24 @@ void drawTurnIcon(int x, int y, int size, uint8_t turn)
     u8g2.drawLine(cx + (arm - 2), cy + arm - 4, cx + (arm - 2) + 5, cy + arm - 9);
     break;
   case 9:  // roundabout (generic — kept as a code for backward
-  case 10: // compatibility, but both now draw via the angle-based icon
-           // below using nav.roundaboutAngleDeg, so any exit direction
-           // (45/90/135/180/225/270/315/...) renders correctly instead of
-           // only ever showing a fixed "left" or "right" variant.
+  case 10: // compatibility)
   {
+    // Preferred path: draw the actual icon bitmap Google Maps rendered,
+    // forwarded by the phone (see IconBitmapConverter.kt / packet format
+    // v2 above). This is what fixed the "sometimes shows the exact exit,
+    // sometimes doesn't" roundabout problem — no angle estimation left to
+    // get wrong, we're just displaying Google's own pixels.
+    if (nav.hasIcon)
+    {
+      u8g2.drawXBMP(x, y, size, size, nav.iconBitmap);
+      break;
+    }
+
+    // Fallback: no bitmap yet (e.g. very first frame of a fresh roundabout
+    // instruction, before the phone's classifier has resolved it as a
+    // roundabout and captured+sent the icon). Draw the old angle-based
+    // vector arrow using whatever angle we last had, so the screen shows
+    // *something* sensible for one frame instead of a blank circle.
     int r = arm - 4;
     u8g2.drawCircle(cx, cy, r);
 
@@ -593,10 +621,29 @@ void onNavPacket(const uint8_t *data, size_t len)
   // its default (90 deg / generic right-ish exit) and instruction text
   // is read starting at byte 8 instead of 9, same as before.
   size_t textStart;
+  nav.hasIcon = false; // reset each packet; only set true below if a fresh bitmap is present
   if (len > 8)
   {
     nav.roundaboutAngleDeg = (uint16_t)((data[8] * 360UL) / 255UL);
     textStart = 9;
+
+    // Byte 9 (when present): iconFlag. 1 means a 128-byte packed 32x32
+    // 1bpp bitmap immediately follows — the actual roundabout icon Maps
+    // drew, forwarded from the phone (see IconBitmapConverter.kt). We only
+    // trust it if the packet is actually long enough to hold the full 128
+    // bytes; a truncated/malformed packet just falls back to the angle
+    // (and ultimately the vector arrow) instead of reading garbage memory.
+    if (len > 9)
+    {
+      uint8_t iconFlag = data[9];
+      textStart = 10;
+      if (iconFlag == 1 && len >= 10 + sizeof(nav.iconBitmap))
+      {
+        memcpy(nav.iconBitmap, data + 10, sizeof(nav.iconBitmap));
+        nav.hasIcon = true;
+        textStart = 10 + sizeof(nav.iconBitmap);
+      }
+    }
   }
   else
   {
