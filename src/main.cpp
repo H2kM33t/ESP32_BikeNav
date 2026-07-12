@@ -226,6 +226,19 @@ void drawTurnIcon(int x, int y, int size, uint8_t turn)
 
   u8g2.setDrawColor(1);
 
+  // Preferred path for every turn type: draw the actual icon bitmap Google
+  // Maps rendered, forwarded by the phone (IconBitmapConverter.kt / packet
+  // format v2). No more classifying into a fixed set of vector shapes -
+  // whatever Maps drew is what shows up here, same approach as maisonsmd's
+  // esp32-google-maps project. Falls through to the vector icons below
+  // only when no bitmap has arrived yet (e.g. very first frame of a fresh
+  // instruction, before the phone has captured+sent the icon).
+  if (nav.hasIcon)
+  {
+    u8g2.drawXBMP(x, y, size, size, nav.iconBitmap);
+    return;
+  }
+
   switch (turn)
   {
   case 1: // turn-left: clean 90-degree corner (up, then left)
@@ -280,22 +293,11 @@ void drawTurnIcon(int x, int y, int size, uint8_t turn)
   case 9:  // roundabout (generic — kept as a code for backward
   case 10: // compatibility)
   {
-    // Preferred path: draw the actual icon bitmap Google Maps rendered,
-    // forwarded by the phone (see IconBitmapConverter.kt / packet format
-    // v2 above). This is what fixed the "sometimes shows the exact exit,
-    // sometimes doesn't" roundabout problem — no angle estimation left to
-    // get wrong, we're just displaying Google's own pixels.
-    if (nav.hasIcon)
-    {
-      u8g2.drawXBMP(x, y, size, size, nav.iconBitmap);
-      break;
-    }
-
-    // Fallback: no bitmap yet (e.g. very first frame of a fresh roundabout
-    // instruction, before the phone's classifier has resolved it as a
-    // roundabout and captured+sent the icon). Draw the old angle-based
-    // vector arrow using whatever angle we last had, so the screen shows
-    // *something* sensible for one frame instead of a blank circle.
+    // The nav.hasIcon bitmap path is already handled at the top of this
+    // function for every turn code. Everything below only runs when no
+    // bitmap has arrived yet - the old angle-based vector arrow, kept as a
+    // one-frame fallback using whatever angle we last had, so the screen
+    // shows *something* sensible instead of a blank circle.
     int r = arm - 4;
     u8g2.drawCircle(cx, cy, r);
 
