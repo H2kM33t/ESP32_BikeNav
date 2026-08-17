@@ -2,7 +2,7 @@
 
 /*
   BikeNav TFT Display Firmware
-  ESP32 + 1.8" SPI TFT (ST7735, 128x160) via Adafruit_GFX/ST7735 + NimBLE
+  ESP32-C3 SuperMini + 1.8" SPI TFT (ST7735, 128x160) via Adafruit_GFX/ST7735 + NimBLE
 
   The display is mounted/used in LANDSCAPE (rotation 1), giving a 160
   (wide) x 128 (tall) logical canvas — the same aspect the layout below
@@ -60,13 +60,19 @@
 #include <string.h> // memcpy, for copying the roundabout icon bitmap out of BLE packets
 
 // ---------------- SPI TFT pins ----------------
-// Hardware SPI (VSPI on a plain esp32dev board: SCK=18, MOSI=23, MISO=19 —
-// wired automatically once you pass &SPI to the constructor below, no need
-// to set them explicitly). Only CS/DC/RST are freely choosable GPIOs; set
-// these to whatever your board actually uses.
-#define TFT_CS 5
+// Target board: ESP32-C3 SuperMini. The C3 only has one hardware SPI
+// (FSPI); its default pins are SCK=4, MISO=5, MOSI=6, SS=7. We call
+// SPI.begin() explicitly in setup() below with those pins rather than
+// relying on board defaults, so this keeps working even if a different
+// C3 board variant ships different defaults. GPIO8/9 are strapping pins
+// used at boot (9 = boot mode select) so they're avoided here even though
+// they're broken out on the SuperMini silkscreen.
+#define TFT_SCK 4
+#define TFT_MISO 5
+#define TFT_MOSI 6
+#define TFT_CS 7
 #define TFT_DC 2
-#define TFT_RST 4
+#define TFT_RST 3
 
 // Panel is used in landscape, giving a 160(w) x 128(h) logical canvas.
 // Rotation 1 = landscape with the ribbon cable on the left; if your text
@@ -1010,6 +1016,11 @@ void setup()
   delay(1000); // give the serial monitor time to attach
   Serial.println();
   Serial.println("=== BikeNav Display booting ===");
+
+  // ESP32-C3 has only one hardware SPI bus and no fixed "VSPI/HSPI"
+  // default pins guaranteed across all board variants, so wire it up
+  // explicitly to the SuperMini pins defined above before touching the TFT.
+  SPI.begin(TFT_SCK, TFT_MISO, TFT_MOSI, TFT_CS);
 
   Serial.println("[TFT] Initializing ST7735...");
   // INITR_BLACKTAB is the right init sequence for the vast majority of
