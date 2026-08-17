@@ -92,9 +92,38 @@ Adafruit_ST7735 tft(TFT_CS, TFT_DC, TFT_RST);
 // rule below) unchanged from the OLED version.
 GFXcanvas16 canvas(SCREEN_W, SCREEN_H);
 
-#define COL_BG ST77XX_BLACK
-#define COL_FG ST77XX_WHITE
-#define COL_ACCENT ST77XX_CYAN
+// ---------------- Display theme (dark/light) ----------------
+// Was previously #define'd (compile-time only). Now plain globals so the
+// phone app can flip the palette at runtime over BLE (see THEME_CHAR_UUID /
+// ThemeCharCallbacks below) without a reflash. Everything else in this file
+// already referred to these as COL_BG/COL_FG/COL_ACCENT, so turning the
+// macros into variables of the same names is a drop-in change - no other
+// line needs to touch these three symbols.
+uint16_t COL_BG = ST77XX_BLACK;
+uint16_t COL_FG = ST77XX_WHITE;
+uint16_t COL_ACCENT = ST77XX_CYAN;
+bool displayLightMode = false; // false = dark (default), true = light
+
+// Swaps the palette. Cyan-on-black is the classic bike-computer look; for
+// light mode we go black-on-white with an orange accent rather than the
+// same cyan, since cyan-on-white reads as washed-out/low-contrast in direct
+// sunlight, which is exactly when a rider would want the light theme.
+void applyDisplayTheme(bool light)
+{
+  displayLightMode = light;
+  if (light)
+  {
+    COL_BG = ST77XX_WHITE;
+    COL_FG = ST77XX_BLACK;
+    COL_ACCENT = ST77XX_ORANGE;
+  }
+  else
+  {
+    COL_BG = ST77XX_BLACK;
+    COL_FG = ST77XX_WHITE;
+    COL_ACCENT = ST77XX_CYAN;
+  }
+}
 
 // ---------------- BLE ----------------
 // Must match BikeNavApp/BleUuids.kt exactly.
@@ -112,11 +141,20 @@ static const char *NAV_CHAR_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
 // (e.g. once a minute) is enough - the ESP32 free-runs the clock off
 // millis() between updates (see tickClock()).
 static const char *TIME_CHAR_UUID = "6e400004-b5a3-f393-e0a9-e50e24dcca9e";
+// New: lets the phone app toggle the display between dark and light theme.
+// 6e400005 - next free UUID after TIME_CHAR_UUID (03 is
+// BleUuids.MEDIA_CHAR_UUID on the app side, 04 is TIME_CHAR_UUID above).
+// Write 1 byte: 0 = dark (default), 1 = light. The app resends this once
+// on every (re)connect, same pattern as the clock sync, so the display
+// comes back in the last-chosen theme after a BLE drop/reboot rather than
+// always resetting to dark.
+static const char *THEME_CHAR_UUID = "6e400005-b5a3-f393-e0a9-e50e24dcca9e";
 static const char *DEVICE_NAME = "BikeNav";
 
 NimBLEServer *pServer = nullptr;
 NimBLECharacteristic *pNavChar = nullptr;
 NimBLECharacteristic *pTimeChar = nullptr;
+NimBLECharacteristic *pThemeChar = nullptr;
 bool deviceConnected = false;
 
 // ---------------- Nav state ----------------
@@ -945,6 +983,26 @@ class TimeCharCallbacks : public NimBLECharacteristicCallbacks
   }
 };
 
+class ThemeCharCallbacks : public NimBLECharacteristicCallbacks
+{
+  void onWrite(NimBLECharacteristic *pChar, NimBLEConnInfo &connInfo) override
+  {
+    std::string value = pChar->getValue();
+    if (value.length() < 1)
+    {
+      Serial.println("[THEME] Theme packet empty, ignoring.");
+      return;
+    }
+    bool light = (uint8_t)value[0] != 0;
+    // Just updates the global palette variables here - no renderScreen()
+    // call, same discipline as onNavPacket()/TimeCharCallbacks above: this
+    // runs on NimBLE's own task, not loop()'s, and loop()'s repaint picks
+    // the new colours up on its own within 120ms.
+    applyDisplayTheme(light);
+    Serial.printf("[THEME] Set to %s\n", light ? "light" : "dark");
+  }
+};
+
 class ServerCallbacks : public NimBLEServerCallbacks
 {
   void onConnect(NimBLEServer *pServer, NimBLEConnInfo &connInfo) override
@@ -989,6 +1047,11 @@ void setupBle()
       TIME_CHAR_UUID,
       NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
   pTimeChar->setCallbacks(new TimeCharCallbacks());
+
+  pThemeChar = pService->createCharacteristic(
+      THEME_CHAR_UUID,
+      NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+  pThemeChar->setCallbacks(new ThemeCharCallbacks());
 
   // NOTE: pService->start() is deprecated/no-op in newer NimBLE-Arduino —
   // services are started automatically when the server starts advertising.
