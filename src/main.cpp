@@ -59,6 +59,14 @@
 #include <math.h>
 #include <string.h> // memcpy, for copying the roundabout icon bitmap out of BLE packets
 
+// Smooth vector fonts (bundled with Adafruit_GFX) instead of the blocky
+// default 5x7 bitmap font, for a cleaner/more minimal look closer to
+// dedicated bike computers (Beeline etc). Regular weight for the small
+// status-bar/label text, bold for anything meant to read at a glance.
+#include <Fonts/FreeSans9pt7b.h>
+#include <Fonts/FreeSansBold12pt7b.h>
+#include <Fonts/FreeSansBold18pt7b.h>
+
 // ---------------- SPI TFT pins ----------------
 // Target board: ESP32-C3 SuperMini. The C3 only has one hardware SPI
 // (FSPI); its default pins are SCK=4, MISO=5, MOSI=6, SS=7. We call
@@ -262,12 +270,150 @@ String currentTimeString()
 }
 
 // ---------------- Battery ----------------
-// No battery-voltage sensing wired up yet, so this only reserves the icon's
-// screen space and draws its outline for now, same as the request that
-// prompted it — battPercent is plumbed through ready for whenever a
-// voltage divider / fuel-gauge IC gets added (fillFrac below is what you'd
-// wire that up to).
-int battPercent = -1; // -1 = unknown/not wired up yet, draws outline only
+// 3.7V 1S Li-ion/LiPo (3000mAh) sensed through a 47k/47k resistor divider
+// (battery+ -> 47k -> ADC pin -> 47k -> GND), so the ADC sees exactly half
+// the battery voltage. Wire the divider's midpoint to BATT_ADC_PIN below.
+// GPIO0 (ADC1_CH0) is used since GPIO2-7 are already spoken for by the TFT
+// (see TFT_SCK/MISO/MOSI/CS/DC/RST above) — change this if your wiring
+// differs, just keep it on an ADC1-capable pin (GPIO0-4 on the C3).
+#define BATT_ADC_PIN 0
+
+// Divider ratio: Vbatt = Vadc * (R1+R2)/R2 = Vadc * 2 for equal 47k/47k.
+static const float BATT_DIVIDER_RATIO = 2.0f;
+// ESP32-C3's ADC reference with 11dB attenuation (full range) is nominally
+// 3.3V, but factory-to-factory/board-to-board variance is real — if your
+// calculated percentages are consistently off, measure your board's actual
+// 3.3V rail with a multimeter and tweak this constant to match.
+static const float ADC_REF_VOLTAGE = 3.3f;
+static const int ADC_MAX_COUNTS = 4095; // 12-bit ADC
+
+// Single-cell Li-ion discharge curve is flat in the middle, so a straight
+// linear map from 3.0V-4.2V is inaccurate. Piecewise-linear interpolation
+// between these datasheet-typical points instead.
+struct BattPoint
+{
+  float voltage;
+  int percent;
+};
+static const BattPoint BATT_CURVE[] = {
+    {4.20f, 100},
+    {4.00f, 90},
+    {3.85f, 70},
+    {3.70f, 50},
+    {3.50f, 20},
+    {3.30f, 10},
+    {3.00f, 0},
+};
+static const int BATT_CURVE_LEN = sizeof(BATT_CURVE) / sizeof(BATT_CURVE[0]);
+
+int voltageToPercent(float v)
+{
+  if (v >= BATT_CURVE[0].voltage)
+    return 100;
+  if (v <= BATT_CURVE[BATT_CURVE_LEN - 1].voltage)
+    return 0;
+  for (int i = 0; i < BATT_CURVE_LEN - 1; i++)
+  {
+    float vHigh = BATT_CURVE[i].voltage, vLow = BATT_CURVE[i + 1].voltage;
+    if (v <= vHigh && v >= vLow)
+    {
+      float frac = (v - vLow) / (vHigh - vLow);
+      return BATT_CURVE[i + 1].percent + (int)(frac * (BATT_CURVE[i].percent - BATT_CURVE[i + 1].percent));
+    }
+  }
+  return 0;
+}
+
+// Reads a batch of ADC samples and returns the median (not the mean) —
+// the ESP32 ADC occasionally throws a wild outlier sample, and a median
+// shrugs those off in a way a plain average can't.
+float readBatteryVoltageRaw()
+{
+  const int SAMPLES = 32;
+  int counts[SAMPLES];
+  for (int i = 0; i < SAMPLES; i++)
+  {
+    counts[i] = analogRead(BATT_ADC_PIN);
+    delayMicroseconds(200);
+  }
+  // Simple insertion sort - SAMPLES is small (32), no need for anything
+  // fancier, and this avoids pulling in <algorithm> just for one sort.
+  for (int i = 1; i < SAMPLES; i++)
+  {
+    int key = counts[i];
+    int j = i - 1;
+    while (j >= 0 && counts[j] > key)
+    {
+      counts[j + 1] = counts[j];
+      j--;
+    }
+    counts[j + 1] = key;
+  }
+  float medianCounts = (counts[SAMPLES / 2 - 1] + counts[SAMPLES / 2]) / 2.0f;
+  float adcVoltage = (medianCounts / ADC_MAX_COUNTS) * ADC_REF_VOLTAGE;
+  return adcVoltage * BATT_DIVIDER_RATIO;
+}
+
+// Updated periodically by updateBattery() (see loop()); -1 = unknown/not
+// read yet, draws outline only until the first reading comes in.
+int battPercent = -1;
+
+// Re-samples the ADC every BATT_SAMPLE_INTERVAL_MS rather than every frame —
+// battery voltage barely moves frame to frame and analogRead()'s 32-sample
+// median isn't free.
+static const unsigned long BATT_SAMPLE_INTERVAL_MS = 5000;
+
+// Smoothed battery voltage, carried across updateBattery() calls (an
+// exponential moving average, not just an in-the-moment sample average).
+// -1 = not seeded yet.
+static float battVoltageEMA = -1.0f;
+// Lower alpha = smoother/slower to respond to real changes; 0.15 settles
+// out ADC jitter within a few samples while still tracking real discharge
+// over minutes, which is the timescale that actually matters here.
+static const float BATT_EMA_ALPHA = 0.15f;
+
+void updateBattery()
+{
+  static unsigned long lastSample = 0;
+  unsigned long now = millis();
+  if (lastSample != 0 && now - lastSample < BATT_SAMPLE_INTERVAL_MS)
+    return;
+  lastSample = now;
+
+  float v = readBatteryVoltageRaw();
+  if (battVoltageEMA < 0)
+  {
+    battVoltageEMA = v; // first reading: seed directly, no averaging-in
+  }
+  else
+  {
+    battVoltageEMA = BATT_EMA_ALPHA * v + (1.0f - BATT_EMA_ALPHA) * battVoltageEMA;
+  }
+
+  // Hysteresis on top of the smoothed voltage: only let the *displayed*
+  // percentage move once the smoothed voltage has crossed a breakpoint by
+  // a real margin (half a curve-segment's worth), not just nudged over it
+  // by a count or two. This is what actually kills the 90/91 flicker —
+  // EMA alone still settles arbitrarily close to a boundary and can tick
+  // back and forth forever right on top of it.
+  int candidate = voltageToPercent(battVoltageEMA);
+  if (battPercent < 0)
+  {
+    battPercent = candidate; // first reading ever
+  }
+  else if (candidate != battPercent)
+  {
+    int oneUp = voltageToPercent(battVoltageEMA + 0.015f);
+    int oneDown = voltageToPercent(battVoltageEMA - 0.015f);
+    // Only commit to the new value if nudging the voltage slightly still
+    // lands on it (or further) - i.e. it's not sitting right on the edge.
+    if ((candidate > battPercent && oneDown >= candidate) ||
+        (candidate < battPercent && oneUp <= candidate))
+    {
+      battPercent = candidate;
+    }
+  }
+}
 
 void drawBatteryIcon(int x, int y, int w, int h, uint16_t color)
 {
@@ -288,32 +434,59 @@ void drawBatteryIcon(int x, int y, int w, int h, uint16_t color)
 static const unsigned long PACKET_TIMEOUT_MS = 20000;
 
 // ---------------- Text helpers ----------------
-// Adafruit_GFX's default font, at textSize N, is a fixed 6px-wide
-// (5px glyph + 1px gutter) x 8px-tall cell per character, scaled by N.
-// These two helpers stand in for u8g2's getStrWidth()/drawStr(), including
-// treating y as the text BASELINE (bottom of the glyphs) rather than GFX's
-// native top-left cursor, so the rest of the layout code below reads the
-// same way it did with u8g2.
+// "size" here is kept as the same 1/2/3 scale used throughout the rest of
+// the file, but now selects one of the smooth vector fonts above rather
+// than scaling the blocky default bitmap font. Custom GFXfonts already
+// treat the GFX cursor y as the text BASELINE (bottom of the glyphs), same
+// convention the rest of the layout code already assumes, so no manual
+// offset is needed here.
+//
+// Size 0 is the one exception: none of the bundled vector fonts go small
+// enough for dense text like the multi-line turn instruction, so 0 falls
+// back to GFX's original tiny 6x8 bitmap font (setFont(NULL)) instead.
+// That font uses a top-left cursor, not a baseline, so textWidthPx/drawStr
+// special-case it below to keep the baseline convention consistent for
+// callers either way.
+const GFXfont *fontForSize(uint8_t size)
+{
+  if (size == 0)
+    return NULL;
+  if (size == 1)
+    return &FreeSans9pt7b;
+  if (size == 2)
+    return &FreeSansBold12pt7b;
+  return &FreeSansBold18pt7b;
+}
+
 int textWidthPx(const String &s, uint8_t size)
 {
-  return s.length() * 6 * size;
+  if (size == 0)
+    return s.length() * 6; // built-in font: fixed 5px glyph + 1px gutter
+  canvas.setFont(fontForSize(size));
+  int16_t x1, y1;
+  uint16_t w, h;
+  canvas.getTextBounds(s, 0, 0, &x1, &y1, &w, &h);
+  return (int)w;
 }
 
 void drawStr(int x, int y, const String &s, uint8_t size, uint16_t color = COL_FG)
 {
-  canvas.setTextSize(size);
+  canvas.setFont(fontForSize(size));
+  canvas.setTextSize(1); // scaling is done by font choice, not GFX's integer text-size
   canvas.setTextColor(color);
-  canvas.setCursor(x, y - 8 * size);
+  // Built-in font (size 0) takes a top-left cursor; the vector fonts take
+  // a baseline. y is always passed in as a baseline by callers, so shift
+  // it up by the font's ~8px cap height only for the size-0 case.
+  canvas.setCursor(x, size == 0 ? y - 8 : y);
   // Adafruit_GFX defaults to textWrap(true): if a string would run past
   // the canvas's right edge it silently wraps the remaining characters to
-  // x=0 on the next text line (y += 8*size) instead of clipping. That's
-  // what was dumping the tail of a too-wide "4.5km" readout (drawn in the
-  // right column at textSize 3) back onto the left side of the screen,
-  // on top of the turn icon/speed column - the stray "m" in the bug
-  // photo. Every drawStr() call here already does its own layout (fixed
-  // columns, drawWrapped() for the instruction text), so GFX's own
-  // wrapping is never wanted; turn it off and let anything that doesn't
-  // fit just clip at the canvas edge instead of relocating itself.
+  // x=0 on the next text line instead of clipping. That's what was dumping
+  // the tail of a too-wide "4.5km" readout back onto the left side of the
+  // screen, on top of the turn icon/speed column. Every drawStr() call
+  // here already does its own layout (fixed columns, drawWrapped() for the
+  // instruction text), so GFX's own wrapping is never wanted; turn it off
+  // and let anything that doesn't fit just clip at the canvas edge instead
+  // of relocating itself.
   canvas.setTextWrap(false);
   canvas.print(s);
 }
@@ -672,22 +845,53 @@ String loadingDots(unsigned long periodMs, int maxDots)
 // for screens that have something to say there. Pass "" for leftLabel to
 // leave that side blank.
 const int STATUS_BAR_H = 16;
-const int BATT_W = 20, BATT_H = 10;
+
+// Shrinks s (appending "...") until it fits within maxWidth at the given
+// font size. The vector fonts are noticeably wider than the old bitmap
+// font, so long left-side labels (e.g. "Total: 4.5km") can now run into
+// the time/battery cluster on the right if left unclamped.
+String truncateToFit(String s, uint8_t size, int maxWidth)
+{
+  if (textWidthPx(s, size) <= maxWidth)
+    return s;
+  while (s.length() > 0 && textWidthPx(s + "...", size) > maxWidth)
+  {
+    s.remove(s.length() - 1);
+  }
+  if (s.length() == 0)
+    return s;
+  return s + "...";
+}
 
 void drawStatusBar(const String &leftLabel)
 {
-  if (leftLabel.length() > 0)
-  {
-    drawStr(4, 12, leftLabel, 1);
-  }
-
-  int battX = SCREEN_W - 4 - BATT_W;
-  int battY = 3;
-  drawBatteryIcon(battX, battY, BATT_W, BATT_H, COL_FG);
+  // Whole status bar now uses size 0 (the tiny built-in bitmap font) —
+  // "Total: X.Xkm", the clock, and the battery % were all still a bit
+  // large for a top strip that's meant to be a glance-only readout.
+  // Right-hand group: just the clock and the battery percentage (icon
+  // dropped - it was eating width that "Total: X.Xkm" needed on the left,
+  // and the number alone reads just as clearly). Laid out right-to-left:
+  // percentage rightmost, time to its left.
+  String pct = (battPercent >= 0) ? (String(battPercent) + "%") : "";
+  int pctW = textWidthPx(pct, 0);
+  int pctX = SCREEN_W - 4 - pctW;
 
   String t = currentTimeString();
-  int tW = textWidthPx(t, 1);
-  drawStr(battX - 6 - tW, 12, t, 1);
+  int tW = textWidthPx(t, 0);
+  int timeX = pctX - 8 - tW;
+
+  if (leftLabel.length() > 0)
+  {
+    int available = timeX - 4 - 4; // margin before the time text starts
+    String clipped = truncateToFit(leftLabel, 0, available);
+    drawStr(4, 11, clipped, 0);
+  }
+
+  drawStr(timeX, 11, t, 0);
+  if (pct.length() > 0)
+  {
+    drawStr(pctX, 11, pct, 0);
+  }
 }
 
 // Route-progress bar along the very bottom of every screen: outline plus
@@ -812,15 +1016,17 @@ void renderNavigationActive()
   {
     nextLineSize--;
   }
-  drawStr(rightX, contentTop + 30, nextLine, nextLineSize, COL_ACCENT);
+  drawStr(rightX, contentTop + 32, nextLine, nextLineSize, COL_ACCENT);
 
-  canvas.drawFastHLine(rightX, contentTop + 36, rightW, COL_FG);
+  canvas.drawFastHLine(rightX, contentTop + 42, rightW, COL_FG);
 
-  // Instruction text (e.g. "Turn right onto Oak Street"), wrapped, small
-  // type so 2-3 lines fit under the big distance readout.
+  // Instruction text (e.g. "Turn right onto Oak Street"), wrapped, in the
+  // small built-in bitmap font (size 0) rather than the vector font — the
+  // vector font at its smallest (9pt) was too large for a 3-line wrapped
+  // instruction to read comfortably; the tiny 6x8 font fits more per line.
   String instr = nav.instruction;
   instr.replace("|", " ");
-  drawWrapped(instr, rightX, contentTop + 52, rightW, 14, 3, 1);
+  drawWrapped(instr, rightX, contentTop + 58, rightW, 10, 3, 0);
 
   if (stale)
   {
@@ -1108,6 +1314,14 @@ void setup()
   // explicitly to the SuperMini pins defined above before touching the TFT.
   SPI.begin(TFT_SCK, TFT_MISO, TFT_MOSI, TFT_CS);
 
+  // Battery divider ADC: 12-bit resolution, 11dB attenuation for full
+  // 0-3.3V input range (needed since the divider midpoint can be up to
+  // ~2.1V at a full 4.2V battery).
+  analogReadResolution(12);
+  analogSetPinAttenuation(BATT_ADC_PIN, ADC_11db);
+  updateBattery(); // seeds the EMA and gets a real reading before first paint
+  Serial.printf("[BATT] Initial reading: %d%%\n", battPercent);
+
   Serial.println("[TFT] Initializing ST7735...");
   // INITR_BLACKTAB is the right init sequence for the vast majority of
   // 1.8" 128x160 SPI TFT modules sold as "ST7735 1.8 TFT" (the ones with a
@@ -1145,6 +1359,7 @@ void loop()
 {
   tickClock();
   pollSerialClockSet();
+  updateBattery();
 
   // Repaint frequently enough for the waiting/connected animations to
   // read as smooth motion rather than a slideshow, and so the "(stale)"
