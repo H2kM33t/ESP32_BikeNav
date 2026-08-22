@@ -304,6 +304,17 @@ void drawStr(int x, int y, const String &s, uint8_t size, uint16_t color = COL_F
   canvas.setTextSize(size);
   canvas.setTextColor(color);
   canvas.setCursor(x, y - 8 * size);
+  // Adafruit_GFX defaults to textWrap(true): if a string would run past
+  // the canvas's right edge it silently wraps the remaining characters to
+  // x=0 on the next text line (y += 8*size) instead of clipping. That's
+  // what was dumping the tail of a too-wide "4.5km" readout (drawn in the
+  // right column at textSize 3) back onto the left side of the screen,
+  // on top of the turn icon/speed column - the stray "m" in the bug
+  // photo. Every drawStr() call here already does its own layout (fixed
+  // columns, drawWrapped() for the instruction text), so GFX's own
+  // wrapping is never wanted; turn it off and let anything that doesn't
+  // fit just clip at the canvas edge instead of relocating itself.
+  canvas.setTextWrap(false);
   canvas.print(s);
 }
 
@@ -647,7 +658,7 @@ String loadingDots(unsigned long periodMs, int maxDots)
   for (int i = 0; i < count; i++)
     s += '.';
   return s;
-}
+} 
 
 // ---------------- Screens ----------------
 // Coordinates below target the 160x128 landscape canvas (see SCREEN_W/H
@@ -788,8 +799,20 @@ void renderNavigationActive()
 
   // Distance to next turn — big, this is the number that matters most
   // moment-to-moment so it gets the biggest type in the right column.
+  // Size 3 reads "0.0km"/"999m" fine, but a value like "4.5km" (5 glyphs
+  // * 18px = 90px) is wider than the right column itself (rightW, ~78px
+  // at this layout) - with GFX's default wrap that overflow used to jump
+  // to the far left of the NEXT text row and land on top of the icon
+  // column (see drawStr()'s comment); now that wrap is off it would just
+  // clip instead. Neither is great, so pick the largest size (3, then 2)
+  // that actually fits rightW before drawing, same idea as a shrink-to-fit.
   String nextLine = formatDistance(nav.distToTurn);
-  drawStr(rightX, contentTop + 30, nextLine, 3, COL_ACCENT);
+  uint8_t nextLineSize = 3;
+  while (nextLineSize > 1 && textWidthPx(nextLine, nextLineSize) > rightW)
+  {
+    nextLineSize--;
+  }
+  drawStr(rightX, contentTop + 30, nextLine, nextLineSize, COL_ACCENT);
 
   canvas.drawFastHLine(rightX, contentTop + 36, rightW, COL_FG);
 
